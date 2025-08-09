@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "LeetCode Topic Accuracy",
+  "version": "1.0",
+  "description": "Show your topic-wise and difficulty-wise accuracy on LeetCode problem pages.",
+  "permissions": [
+    "storage",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://leetcode.com/*",
+    "https://leetcode.com/graphql/*" 
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://leetcode.com/problems/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+} 
