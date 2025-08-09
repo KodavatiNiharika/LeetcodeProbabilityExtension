@@ -27,10 +27,10 @@ async function fetchLeetCodeGraphQL(query, variables) {
     throw new Error(`GraphQL errors: ${JSON.stringify(jsonResponse.errors)}`);
   }
 
-  // Specific check for problemsetQuestionList, might be null if no data
-  if (query.includes("problemsetQuestionList") && (!jsonResponse.data || !jsonResponse.data.questions)) {
-      console.error("Unexpected GraphQL data structure for problemsetQuestionList:", jsonResponse);
-      throw new Error("Unexpected GraphQL response structure. Missing data.data.questions for problemsetQuestionList.");
+  // Specific check for problemsetQuestionListV2, might be null if no data
+  if (query.includes("problemsetQuestionListV2") && (!jsonResponse.data || !jsonResponse.data.problemsetQuestionListV2)) {
+      console.error("Unexpected GraphQL data structure for problemsetQuestionListV2:", jsonResponse);
+      throw new Error("Unexpected GraphQL response structure. Missing data.problemsetQuestionListV2 for problemsetQuestionListV2.");
   }
 
   return jsonResponse; // Return the full JSON response
@@ -78,6 +78,84 @@ async function fetchAndCacheProblemDetailsForSlugs(slugsToFetch) {
   await Promise.all(fetchPromises);
   await chrome.storage.local.set({ problemDetailsCache: currentCache });
   return currentCache;
+}
+
+// --- NEW: Compute and cache global difficulty totals (Easy/Medium/Hard) ---
+async function updateGlobalDifficultyTotals() {
+  try {
+    console.log('[Accuracy] Fetching global difficulty totals...');
+    const query = `
+      query problemsetQuestionListV2($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionFilterInput) {
+        problemsetQuestionListV2(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+          total
+          questions {
+            difficulty
+            questionFrontendId
+            paidOnly
+            title
+            titleSlug
+            acRate
+            status
+            topicTags { name slug }
+          }
+        }
+      }
+    `;
+    const variables = { categorySlug: "", filters: {}, skip: 0, limit: 5000 };
+    const data = await fetchLeetCodeGraphQL(query, variables);
+    const questions = (data && data.data && data.data.problemsetQuestionListV2 && data.data.problemsetQuestionListV2.questions) || [];
+
+    const totals = { Easy: 0, Medium: 0, Hard: 0 };
+    questions.forEach(q => {
+      if (q && q.difficulty && totals.hasOwnProperty(q.difficulty)) {
+        totals[q.difficulty] += 1;
+      }
+    });
+
+    await chrome.storage.local.set({ globalTotalsByDiff: totals });
+    console.log('[Accuracy] Global difficulty totals updated:', totals);
+    return totals;
+  } catch (e) {
+    console.error('Failed to update global difficulty totals:', e);
+    return null;
+  }
+}
+
+// --- NEW: Compute and cache global difficulty totals and solved counts (Easy/Medium/Hard) via questionList ---
+async function updateGlobalDifficultyTotalsAndSolved() {
+  try {
+    console.log('[Accuracy] Fetching global difficulty totals and solved via questionList...');
+    const query = `
+      query allDifficultyTotals {
+        easyAll: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: EASY }) { total: totalNum }
+        easySolved: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: EASY, status: AC }) { total: totalNum }
+        mediumAll: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: MEDIUM }) { total: totalNum }
+        mediumSolved: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: MEDIUM, status: AC }) { total: totalNum }
+        hardAll: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: HARD }) { total: totalNum }
+        hardSolved: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: HARD, status: AC }) { total: totalNum }
+      }
+    `;
+    const data = await fetchLeetCodeGraphQL(query, {});
+    const res = data && data.data;
+    const totals = {
+      Easy: res?.easyAll?.total ?? 0,
+      Medium: res?.mediumAll?.total ?? 0,
+      Hard: res?.hardAll?.total ?? 0
+    };
+    const solved = {
+      Easy: res?.easySolved?.total ?? 0,
+      Medium: res?.mediumSolved?.total ?? 0,
+      Hard: res?.hardSolved?.total ?? 0
+    };
+    await new Promise(resolve => chrome.storage.local.set({ globalTotalsByDiff: totals }, resolve));
+    await new Promise(resolve => chrome.storage.local.set({ globalSolvedByDiff: solved }, resolve));
+    console.log('[Accuracy] Updated globalTotalsByDiff:', totals);
+    console.log('[Accuracy] Updated globalSolvedByDiff:', solved);
+    return { totals, solved };
+  } catch (e) {
+    console.error('Failed to fetch difficulty totals/solved via questionList:', e);
+    return null;
+  }
 }
 
 // --- Function to fetch all submissions ---
@@ -340,13 +418,13 @@ async function calculateAndDisplayAccuracy() {
     return { tagStats, diffStats };
   }
 
-  function computeScores(tagStats, diffStats, alpha = 0.6) { // Removed totalProblemsByTag, totalProblemsByDifficulty
+  function computeScores(tagStats, diffStats, alpha = 0.6, globalTotalsByDiff = null, globalSolvedByDiff = null) { // Removed totalProblemsByTag, totalProblemsByDifficulty
     const tagScores = {};
     const diffScores = {};
 
     for (let tag in tagStats) {
       const fam = tagStats[tag].attempted > 0 ? tagStats[tag].solved / tagStats[tag].attempted : 0;
-      const cov = tagStats[tag].attempted > 0 ? 1 : 0; // Simplified coverage
+      const cov = tagStats[tag].attempted > 0 ? 1 : 0; // Simplified coverage (display adjusted later)
       const acc = tagStats[tag].totalSubs > 0 ? tagStats[tag].correctSubs / tagStats[tag].totalSubs : 0;
 
       tagScores[tag] = {
@@ -357,18 +435,50 @@ async function calculateAndDisplayAccuracy() {
       };
     }
 
-    for (let diff in diffStats) {
-      const fam = diffStats[diff].attempted > 0 ? diffStats[diff].solved / diffStats[diff].attempted : 0;
-      const cov = diffStats[diff].attempted > 0 ? 1 : 0; // Simplified coverage
-      const acc = diffStats[diff].totalSubs > 0 ? diffStats[diff].correctSubs / diffStats[diff].totalSubs : 0;
+    // Difficulty coverage per rules using totals and solved from questionList if available:
+    const totalE = (globalTotalsByDiff && typeof globalTotalsByDiff.Easy === 'number') ? globalTotalsByDiff.Easy : 0;
+    const totalM = (globalTotalsByDiff && typeof globalTotalsByDiff.Medium === 'number') ? globalTotalsByDiff.Medium : 0;
+    const totalH = (globalTotalsByDiff && typeof globalTotalsByDiff.Hard === 'number') ? globalTotalsByDiff.Hard : 0;
 
-      diffScores[diff] = {
+    const solvedE_ext = (globalSolvedByDiff && typeof globalSolvedByDiff.Easy === 'number') ? globalSolvedByDiff.Easy : null;
+    const solvedM_ext = (globalSolvedByDiff && typeof globalSolvedByDiff.Medium === 'number') ? globalSolvedByDiff.Medium : null;
+    const solvedH_ext = (globalSolvedByDiff && typeof globalSolvedByDiff.Hard === 'number') ? globalSolvedByDiff.Hard : null;
+
+    // Fallback to local diffStats solved counts if external solved unavailable
+    const solvedE_local = (diffStats.Easy && typeof diffStats.Easy.solved === 'number') ? diffStats.Easy.solved : 0;
+    const solvedM_local = (diffStats.Medium && typeof diffStats.Medium.solved === 'number') ? diffStats.Medium.solved : 0;
+    const solvedH_local = (diffStats.Hard && typeof diffStats.Hard.solved === 'number') ? diffStats.Hard.solved : 0;
+
+    const solvedE = (solvedE_ext != null) ? solvedE_ext : solvedE_local;
+    const solvedM = (solvedM_ext != null) ? solvedM_ext : solvedM_local;
+    const solvedH = (solvedH_ext != null) ? solvedH_ext : solvedH_local;
+
+    const difficulties = ['Easy', 'Medium', 'Hard'];
+    difficulties.forEach(d => {
+      const fam = diffStats[d]?.attempted > 0 ? diffStats[d].solved / diffStats[d].attempted : 0;
+      const acc = diffStats[d]?.totalSubs > 0 ? diffStats[d].correctSubs / diffStats[d].totalSubs : 0;
+      let cov = 0;
+      if (d === 'Easy') {
+        const num = solvedE + solvedM + solvedH;
+        const den = totalE + totalM + totalH;
+        cov = den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
+      } else if (d === 'Medium') {
+        const num = solvedM + solvedH;
+        const den = totalM + totalH;
+        cov = den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
+      } else if (d === 'Hard') {
+        const num = solvedH;
+        const den = totalH;
+        cov = den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
+      }
+
+      diffScores[d] = {
         familiarity: fam,
         coverage: cov,
         accuracy: acc,
         score: alpha * fam + (1 - alpha) * cov
       };
-    }
+    });
 
     return { tagScores, diffScores };
   }
@@ -376,7 +486,31 @@ async function calculateAndDisplayAccuracy() {
   // Main calculation steps:
 
   const { tagStats, diffStats } = calculateStats(submissions);
-  const { tagScores, diffScores } = computeScores(tagStats, diffStats);
+
+  // Ensure we have global difficulty totals and solved counts
+  let { globalTotalsByDiff } = await new Promise(resolve => {
+    try {
+      chrome.storage.local.get(['globalTotalsByDiff'], (items) => resolve(items || {}));
+    } catch (e) {
+      resolve({});
+    }
+  });
+  let { globalSolvedByDiff } = await new Promise(resolve => {
+    try {
+      chrome.storage.local.get(['globalSolvedByDiff'], (items) => resolve(items || {}));
+    } catch (e) {
+      resolve({});
+    }
+  });
+  if (!globalTotalsByDiff || typeof globalTotalsByDiff.Easy !== 'number' || typeof globalTotalsByDiff.Medium !== 'number' || typeof globalTotalsByDiff.Hard !== 'number' ||
+      !globalSolvedByDiff || typeof globalSolvedByDiff.Easy !== 'number' || typeof globalSolvedByDiff.Medium !== 'number' || typeof globalSolvedByDiff.Hard !== 'number') {
+    const res = await updateGlobalDifficultyTotalsAndSolved();
+    if (res) { globalTotalsByDiff = res.totals; globalSolvedByDiff = res.solved; }
+  } else {
+    console.log('[Accuracy] Using cached totals/solved by difficulty:', globalTotalsByDiff, globalSolvedByDiff);
+  }
+
+  const { tagScores, diffScores } = computeScores(tagStats, diffStats, 0.6, globalTotalsByDiff, globalSolvedByDiff);
 
   const allSolvedCount = new Set(submissions.filter(s => s.status === "AC").map(s => s.problem)).size;
   const allAttemptedCount = new Set(submissions.map(s => s.problem)).size;
@@ -418,6 +552,7 @@ async function calculateAndDisplayAccuracy() {
       const totalKey = `tagTotal_${slug}`;
       const solvedKey = `tagSolved_${slug}`;
       const byDiffKey = `tagTotalsByDiff_${slug}`;
+
       const total = stored[totalKey];
       const solved = stored[solvedKey];
       const byDiff = stored[byDiffKey];
@@ -533,33 +668,33 @@ async function calculateAndDisplayAccuracy() {
       probDisplay.textContent = `${result.probability}`;
 
       // Add/Update tag totals display
-      let tagTotalsEl = document.getElementById('leetcode-tag-totals');
-      const tagTotalsText = (tagTotalsForDisplay || [])
-        .filter(t => typeof t.total === 'number' && typeof t.solved === 'number')
-        .map(t => {
-          const base = `${t.name}: ${t.solved}/${t.total}`;
-          const d = t.byDiff || {};
-          const fmt = (x) => typeof x === 'number' ? x : 0;
-          if (d.Easy || d.Medium || d.Hard) {
-            const e = d.Easy || {}; const m = d.Medium || {}; const h = d.Hard || {};
-            return `${base} (E ${fmt(e.solved)}/${fmt(e.total)} • M ${fmt(m.solved)}/${fmt(m.total)} • H ${fmt(h.solved)}/${fmt(h.total)})`;
-          }
-          return base;
-        })
-        .join(' | ');
+      // let tagTotalsEl = document.getElementById('leetcode-tag-totals');
+      // const tagTotalsText = (tagTotalsForDisplay || [])
+      //   .filter(t => typeof t.total === 'number' && typeof t.solved === 'number')
+      //   .map(t => {
+      //     const base = `${t.name}: ${t.solved}/${t.total}`;
+      //     const d = t.byDiff || {};
+      //     const fmt = (x) => typeof x === 'number' ? x : 0;
+      //     if (d.Easy || d.Medium || d.Hard) {
+      //       const e = d.Easy || {}; const m = d.Medium || {}; const h = d.Hard || {};
+      //       return `${base} (E ${fmt(e.solved)}/${fmt(e.total)} • M ${fmt(m.solved)}/${fmt(m.total)} • H ${fmt(h.solved)}/${fmt(h.total)})`;
+      //     }
+      //     return base;
+      //   })
+      //   .join(' | ');
 
-      if (tagTotalsText) {
-        if (!tagTotalsEl) {
-          tagTotalsEl = document.createElement('span');
-          tagTotalsEl.id = 'leetcode-tag-totals';
-          tagTotalsEl.style.marginLeft = '10px';
-          tagTotalsEl.style.fontSize = '14px';
-          tagTotalsEl.style.color = '#9aa0a6';
-          problemLinkElement.parentNode.insertBefore(tagTotalsEl, probDisplay.nextSibling);
-        }
-        tagTotalsEl.textContent = tagTotalsText;
-        tagTotalsEl.title = 'Per-topic solved/total and difficulty split based on fetched tag lists';
-      }
+      // if (tagTotalsText) {
+      //   if (!tagTotalsEl) {
+      //     tagTotalsEl = document.createElement('span');
+      //     tagTotalsEl.id = 'leetcode-tag-totals';
+      //     tagTotalsEl.style.marginLeft = '10px';
+      //     tagTotalsEl.style.fontSize = '14px';
+      //     tagTotalsEl.style.color = '#9aa0a6';
+      //     problemLinkElement.parentNode.insertBefore(tagTotalsEl, probDisplay.nextSibling);
+      //   }
+      //   tagTotalsEl.textContent = tagTotalsText;
+      //   tagTotalsEl.title = 'Per-topic solved/total and difficulty split based on fetched tag lists';
+      // }
     } else {
       console.warn("Could not find the problem link element within the title container.");
     }

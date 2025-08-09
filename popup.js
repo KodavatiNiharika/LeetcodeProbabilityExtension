@@ -230,14 +230,57 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
           return stats;
       }
 
-      // Existing: Calculate difficulty score (overall, from submitted problems)
-      function calcDiffScore(diffStat) {
-          const solved = diffStat.solved.size;
-          const attempted = diffStat.attempted.size;
+      // Read global totals per difficulty from storage (set by content script)
+      async function getGlobalTotalsByDifficultyFromStorage() {
+          return await new Promise((resolve) => {
+              try {
+                  chrome.storage.local.get(['globalTotalsByDiff'], (items) => {
+                      const cached = (items && items.globalTotalsByDiff) || null;
+                      if (cached) {
+                        console.log('[Accuracy][popup] Read globalTotalsByDiff from storage:', cached);
+                      } else {
+                        console.warn('[Accuracy][popup] No globalTotalsByDiff in storage yet.');
+                      }
+                      resolve(cached);
+                  });
+              } catch (e) {
+                  console.error('getGlobalTotalsByDifficultyFromStorage error:', e);
+                  resolve(null);
+              }
+          });
+      }
+
+      // Calculate difficulty score with coverage per rules using provided stats and totals
+      function calcDiffScoreWithCoverage(diffName, allDiffStats, globalTotalsByDiff, betaWeight) {
+          const stat = allDiffStats[diffName];
+          const solved = stat ? stat.solved.size : 0;
+          const attempted = stat ? stat.attempted.size : 0;
           const attempt_fam = attempted ? solved / attempted : 0;
-          // Coverage is 1 because we don't have global problem list
-          const coverage = 1;
-          return beta * attempt_fam + (1 - beta) * coverage;
+
+          const totals = globalTotalsByDiff || { Easy: 0, Medium: 0, Hard: 0 };
+          const solvedE = (allDiffStats.Easy && allDiffStats.Easy.solved) ? allDiffStats.Easy.solved.size : 0;
+          const solvedM = (allDiffStats.Medium && allDiffStats.Medium.solved) ? allDiffStats.Medium.solved.size : 0;
+          const solvedH = (allDiffStats.Hard && allDiffStats.Hard.solved) ? allDiffStats.Hard.solved.size : 0;
+
+          let coverage;
+          if (!totals || (totals.Easy|0) + (totals.Medium|0) + (totals.Hard|0) === 0) {
+              // Fallback to previous behavior if totals unavailable
+              coverage = 1;
+          } else if (diffName === 'Easy') {
+              const num = solvedE + solvedM + solvedH;
+              const den = (totals.Easy || 0) + (totals.Medium || 0) + (totals.Hard || 0);
+              coverage = den > 0 ? Math.min(1, num / den) : 0;
+          } else if (diffName === 'Medium') {
+              const num = solvedM + solvedH;
+              const den = (totals.Medium || 0) + (totals.Hard || 0);
+              coverage = den > 0 ? Math.min(1, num / den) : 0;
+          } else { // Hard
+              const num = solvedH;
+              const den = (totals.Hard || 0);
+              coverage = den > 0 ? Math.min(1, num / den) : 0;
+          }
+
+          return betaWeight * attempt_fam + (1 - betaWeight) * coverage;
       }
 
       // Existing: MyAcceptance with penalty
@@ -275,9 +318,27 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
 
       // 2. Get overall stats per difficulty from user's submissions
       const diffStats = getDiffStats(submissions);
+      const globalTotalsByDiff = await getGlobalTotalsByDifficultyFromStorage();
       const diffScoresCalculated = {};
+
+      // Also read solved-by-diff if available
+      const globalSolvedByDiff = await new Promise(resolve => {
+        try {
+          chrome.storage.local.get(['globalSolvedByDiff'], (items) => resolve((items && items.globalSolvedByDiff) || null));
+        } catch (e) {
+          resolve(null);
+        }
+      });
+      if (globalTotalsByDiff) {
+        console.log('[Accuracy][popup] totalsByDiff:', globalTotalsByDiff, 'solvedByDiff:', globalSolvedByDiff);
+      }
+
       for (const diff in diffStats) {
-          diffScoresCalculated[diff] = calcDiffScore(diffStats[diff]);
+          const score = calcDiffScoreWithCoverage(diff, diffStats, globalTotalsByDiff, beta);
+          if (globalTotalsByDiff) {
+            console.log(`[Accuracy][popup] Diff ${diff}: fam=${(diffStats[diff].attempted.size? (diffStats[diff].solved.size/diffStats[diff].attempted.size).toFixed(3):'0.000')} coverageTotals=`, globalTotalsByDiff, 'score=', score.toFixed(3));
+          }
+          diffScoresCalculated[diff] = score;
       }
 
       // 3. Get overall personal acceptance stats from user's submissions
