@@ -147,10 +147,8 @@ async function updateGlobalDifficultyTotalsAndSolved() {
       Medium: res?.mediumSolved?.total ?? 0,
       Hard: res?.hardSolved?.total ?? 0
     };
-    await new Promise(resolve => chrome.storage.local.set({ globalTotalsByDiff: totals }, resolve));
-    await new Promise(resolve => chrome.storage.local.set({ globalSolvedByDiff: solved }, resolve));
-    console.log('[Accuracy] Updated globalTotalsByDiff:', totals);
-    console.log('[Accuracy] Updated globalSolvedByDiff:', solved);
+    console.log('[Accuracy] Fetched totalsByDiff:', totals);
+    console.log('[Accuracy] Fetched solvedByDiff:', solved);
     return { totals, solved };
   } catch (e) {
     console.error('Failed to fetch difficulty totals/solved via questionList:', e);
@@ -488,27 +486,10 @@ async function calculateAndDisplayAccuracy() {
   const { tagStats, diffStats } = calculateStats(submissions);
 
   // Ensure we have global difficulty totals and solved counts
-  let { globalTotalsByDiff } = await new Promise(resolve => {
-    try {
-      chrome.storage.local.get(['globalTotalsByDiff'], (items) => resolve(items || {}));
-    } catch (e) {
-      resolve({});
-    }
-  });
-  let { globalSolvedByDiff } = await new Promise(resolve => {
-    try {
-      chrome.storage.local.get(['globalSolvedByDiff'], (items) => resolve(items || {}));
-    } catch (e) {
-      resolve({});
-    }
-  });
-  if (!globalTotalsByDiff || typeof globalTotalsByDiff.Easy !== 'number' || typeof globalTotalsByDiff.Medium !== 'number' || typeof globalTotalsByDiff.Hard !== 'number' ||
-      !globalSolvedByDiff || typeof globalSolvedByDiff.Easy !== 'number' || typeof globalSolvedByDiff.Medium !== 'number' || typeof globalSolvedByDiff.Hard !== 'number') {
-    const res = await updateGlobalDifficultyTotalsAndSolved();
-    if (res) { globalTotalsByDiff = res.totals; globalSolvedByDiff = res.solved; }
-  } else {
-    console.log('[Accuracy] Using cached totals/solved by difficulty:', globalTotalsByDiff, globalSolvedByDiff);
-  }
+  // Always fetch fresh to avoid stale cache affecting calculations
+  let fetchedTotalsSolved = await updateGlobalDifficultyTotalsAndSolved();
+  let globalTotalsByDiff = fetchedTotalsSolved ? fetchedTotalsSolved.totals : { Easy: 0, Medium: 0, Hard: 0 };
+  let globalSolvedByDiff = fetchedTotalsSolved ? fetchedTotalsSolved.solved : { Easy: 0, Medium: 0, Hard: 0 };
 
   const { tagScores, diffScores } = computeScores(tagStats, diffStats, 0.6, globalTotalsByDiff, globalSolvedByDiff);
 

@@ -318,10 +318,11 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
 
       // 2. Get overall stats per difficulty from user's submissions
       const diffStats = getDiffStats(submissions);
+      // We no longer depend on cached totals here; content script fetches fresh values during calculation.
       const globalTotalsByDiff = await getGlobalTotalsByDifficultyFromStorage();
       const diffScoresCalculated = {};
 
-      // Also read solved-by-diff if available
+      // Also read solved-by-diff if available for visibility only
       const globalSolvedByDiff = await new Promise(resolve => {
         try {
           chrome.storage.local.get(['globalSolvedByDiff'], (items) => resolve((items && items.globalSolvedByDiff) || null));
@@ -330,14 +331,11 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
         }
       });
       if (globalTotalsByDiff) {
-        console.log('[Accuracy][popup] totalsByDiff:', globalTotalsByDiff, 'solvedByDiff:', globalSolvedByDiff);
+        console.log('[Accuracy][popup] totalsByDiff (may be stale):', globalTotalsByDiff, 'solvedByDiff:', globalSolvedByDiff);
       }
 
       for (const diff in diffStats) {
           const score = calcDiffScoreWithCoverage(diff, diffStats, globalTotalsByDiff, beta);
-          if (globalTotalsByDiff) {
-            console.log(`[Accuracy][popup] Diff ${diff}: fam=${(diffStats[diff].attempted.size? (diffStats[diff].solved.size/diffStats[diff].attempted.size).toFixed(3):'0.000')} coverageTotals=`, globalTotalsByDiff, 'score=', score.toFixed(3));
-          }
           diffScoresCalculated[diff] = score;
       }
 
