@@ -51,6 +51,53 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 });
 
+const tagSlugInput = document.getElementById("tagSlugInput");
+const btnFetchTagProblems = document.getElementById("btnFetchTagProblems");
+const tagStatsOutput = document.getElementById("tagStatsOutput");
+
+btnFetchTagProblems.addEventListener("click", async () => {
+  const tagSlug = tagSlugInput.value.trim();
+  if (!tagSlug) {
+    tagStatsOutput.textContent = "Please enter a tag slug.";
+    return;
+  }
+
+  tagStatsOutput.textContent = `Fetching problems for tag: ${tagSlug}...`;
+  try {
+    const resp = await sendToActiveTab({ action: "GET_TAG_PROBLEMS", tagSlug: tagSlug });
+    if (resp.success) {
+      const totalProblemsInTag = resp.data.totalLength;
+      // We need to get user's solved problems for this tag.
+      // This requires comparing fetched problems with user's submissions.
+      const allSubmissionsRaw = (await chrome.storage.local.get(["allSubmissions"])).allSubmissions || [];
+      const problemDetailsCache = (await chrome.storage.local.get(["problemDetailsCache"])).problemDetailsCache || {};
+
+      const solvedProblemsInTag = new Set();
+      resp.data.questions.forEach(tagProblem => {
+        // Check if the user has an AC submission for this problem
+        const isSolved = allSubmissionsRaw.some(submission => 
+          submission.titleSlug === tagProblem.titleSlug && submission.status === 10 // 10 is AC status
+        );
+        if (isSolved) {
+          solvedProblemsInTag.add(tagProblem.titleSlug);
+        }
+      });
+
+      tagStatsOutput.textContent = `Tag: ${tagSlug} | Solved: ${solvedProblemsInTag.size} / Total: ${totalProblemsInTag}`;
+
+      // Store this in local storage for the main calculation if needed
+      await chrome.storage.local.set({ [`tagProblems_${tagSlug}`]: resp.data.questions });
+      await chrome.storage.local.set({ [`tagTotal_${tagSlug}`]: totalProblemsInTag });
+      await chrome.storage.local.set({ [`tagSolved_${tagSlug}`]: solvedProblemsInTag.size });
+
+    } else {
+      tagStatsOutput.textContent = "Error fetching tag problems: " + JSON.stringify(resp.error);
+    }
+  } catch (err) {
+    tagStatsOutput.textContent = "Error: " + String(err);
+  }
+});
+
 document.getElementById("btnFetchAllSubmissions").addEventListener("click", async () => {
   try {
     log("Fetching all submissions (may take a while if you have many)...");
@@ -160,12 +207,13 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
       }
 
       // NEW: Calculate score for a combined (tag, difficulty) stat
-      function calcCombinedScore(stat) {
+      function calcCombinedScore(stat, totalProblemsInTag) {
           const solved = stat.solved.size;
           const attempted = stat.attempted.size;
           const attempt_fam = attempted ? solved / attempted : 0;
-          // Coverage is 1 because we don't have global problem list for proper coverage calculation
-          const coverage = 1; 
+          // Coverage is solved problems in tag / total problems in tag
+          const coverage = (totalProblemsInTag > 0) ? (solved / totalProblemsInTag) : 0;
+          
           return alpha * attempt_fam + (1 - alpha) * coverage;
       }
 
@@ -207,7 +255,22 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
       const tagDifficultyStats = getTagDifficultyStats(submissions);
       const combinedScores = {};
       for (const key in tagDifficultyStats) {
-          combinedScores[key] = calcCombinedScore(tagDifficultyStats[key]);
+          const [tag, difficulty] = key.split('_');
+          // We need to pass the total problems for this specific tag and difficulty
+          // For simplicity, for now, we'll use the overall total problems for the CURRENTLY FETCHED tag
+          // If the current problem's tag is the one we fetched, use its total.
+          let totalForCoverage = 0;
+          const fetchedTagSlug = tagSlugInput.value.trim();
+
+          if (fetchedTagSlug === tag) {
+              totalForCoverage = (await chrome.storage.local.get([`tagTotal_${fetchedTagSlug}`]))[`tagTotal_${fetchedTagSlug}`] || 0;
+          } else {
+              // Fallback to 1 if no specific tag total is available or it's not the current fetched tag
+              // This means coverage will still be 1 for other tags not explicitly fetched/calculated.
+              totalForCoverage = 1; // Or you could use a more robust fallback like average total problems per tag if available
+          }
+
+          combinedScores[key] = calcCombinedScore(tagDifficultyStats[key], totalForCoverage);
       }
 
       // 2. Get overall stats per difficulty from user's submissions
@@ -230,12 +293,44 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
       // W1: Average Tag-Difficulty Score for current problem's tags
       let avgTagDifficultyScoreForCurrentProblem = 0;
       if (currentProblemTags.length > 0) {
-          let sumScores = 0;
-          currentProblemTags.forEach(tag => {
-              const key = `${tag}_${currentProblemDifficulty}`;
-              sumScores += (combinedScores[key] || 0); // If no history for this specific (tag,difficulty), score is 0
+          const storageKeys = [];
+          // Load totals/solved per tag for current problem's tags from storage
+          probData.topicTags.forEach(t => {
+            storageKeys.push(`tagTotal_${t.slug}`);
+            storageKeys.push(`tagSolved_${t.slug}`);
           });
-          avgTagDifficultyScoreForCurrentProblem = sumScores / currentProblemTags.length;
+          const stored = await new Promise(resolve => {
+            try {
+              chrome.storage.local.get(storageKeys, (items) => resolve(items || {}));
+            } catch (e) {
+              resolve({});
+            }
+          });
+
+          let sumScores = 0;
+          probData.topicTags.forEach(t => {
+            const tagName = t.name;
+            const slug = t.slug;
+            const key = `${tagName}_${currentProblemDifficulty}`;
+            const stat = tagDifficultyStats[key] || { solved: new Set(), attempted: new Set(), wrong: 0 };
+
+            const solvedCount = stat.solved.size;
+            const attemptedCount = stat.attempted.size;
+            const attemptFam = attemptedCount ? solvedCount / attemptedCount : 0;
+
+            const total = stored[`tagTotal_${slug}`];
+            let coverage;
+            if (typeof total === 'number' && total > 0) {
+              coverage = Math.min(1, solvedCount / total);
+            } else {
+              // Smoothed fallback to avoid overconfidence with very few attempts
+              coverage = (attemptedCount + 2) > 0 ? (solvedCount + 1) / (attemptedCount + 2) : 0;
+            }
+
+            const score = alpha * attemptFam + (1 - alpha) * coverage;
+            sumScores += score;
+          });
+          avgTagDifficultyScoreForCurrentProblem = sumScores / probData.topicTags.length;
       }
 
       // W2: Overall Difficulty Familiarity Score for current problem's difficulty
@@ -284,6 +379,21 @@ document.getElementById("btnCalculate").addEventListener("click", async () => {
         },
         probability: (P * 100).toFixed(2) + "%"
       };
+
+      // Add tag-specific total and solved counts if available
+      const fetchedTagSlug = tagSlugInput.value.trim();
+      if (fetchedTagSlug) {
+        const tagTotal = (await chrome.storage.local.get([`tagTotal_${fetchedTagSlug}`]))[`tagTotal_${fetchedTagSlug}`];
+        const tagSolved = (await chrome.storage.local.get([`tagSolved_${fetchedTagSlug}`]))[`tagSolved_${fetchedTagSlug}`];
+        if (tagTotal !== undefined && tagSolved !== undefined) {
+          result.tagSpecificSummary = {
+            tag: fetchedTagSlug,
+            solvedProblems: tagSolved,
+            totalProblems: tagTotal,
+            calculatedCoverage: (tagTotal > 0) ? (tagSolved / tagTotal).toFixed(3) : "N/A"
+          };
+        }
+      }
 
       let finalOutput = JSON.stringify(result, null, 2);
       finalOutput += "\n\nNote: Accuracy is based on your submitted problems' history only. 'Coverage' metrics assume you've attempted all problems in a category since global problem counts are not used.";

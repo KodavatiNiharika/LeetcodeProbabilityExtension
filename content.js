@@ -135,6 +135,48 @@ async function fetchCurrentUsername() {
   return null;
 }
 
+// Helper to fetch per-topic (knowledge) solved/total and store to chrome.storage
+async function fetchUserTopicProgress() {
+  const query = `
+    query userProgressKnowledgeList {
+      userProgressKnowledgeList {
+        progressKnowledgeInfo {
+          finishedNum
+          totalNum
+          knowledgeTag { slug name nameTranslated }
+        }
+      }
+    }
+  `;
+  const resp = await fetchLeetCodeGraphQL(query, {});
+  const infos = resp?.data?.userProgressKnowledgeList?.progressKnowledgeInfo || [];
+  return infos.map(i => ({
+    slug: i.knowledgeTag?.slug,
+    name: i.knowledgeTag?.name,
+    finishedNum: i.finishedNum || 0,
+    totalNum: i.totalNum || 0,
+  })).filter(i => i.slug);
+}
+
+async function updateUserTopicProgressForTags(topicTags) {
+  try {
+    const all = await fetchUserTopicProgress();
+    const neededSlugs = new Set(topicTags.map(t => t.slug));
+    const toStore = {};
+    all.forEach(i => {
+      if (neededSlugs.has(i.slug)) {
+        toStore[`tagTotal_${i.slug}`] = i.totalNum;
+        toStore[`tagSolved_${i.slug}`] = i.finishedNum;
+      }
+    });
+    if (Object.keys(toStore).length > 0) {
+      await new Promise(resolve => chrome.storage.local.set(toStore, resolve));
+    }
+  } catch (e) {
+    console.warn('Failed to update user topic progress:', e);
+  }
+}
+
 // --- Core Calculation Logic (Moved from popup.js, slightly adapted) ---
 async function calculateAndDisplayAccuracy() {
   console.log('Starting accuracy calculation...');
@@ -235,102 +277,173 @@ async function calculateAndDisplayAccuracy() {
 
   if (submissions.length === 0) {
     console.log("No valid submissions with problem details to calculate accuracy.");
+    // If no submissions, we still might want to show some probability based on global stats or user can fetch later
+    // For now, we will return. Can be improved.
     return;
   }
 
-  // --- Calculation Functions (copied from your example) ---
-  const alpha = 0.7;
-  const beta = 0.7;
-  const gamma = 0.5;
-  const W1 = 0.4, W2 = 0.4, W3 = 0.2;
-  const smoothing = 1;
+  // --- Calculation Functions ---
 
-  function uniqueProblems(data) {
-      return [...new Set(data.map(d => d.problem))];
-  }
+  function calculateStats(submissions) { // Removed totalProblemsByTag, totalProblemsByDifficulty
+    const tagStats = {};
+    const diffStats = {};
 
-  function getTagDifficultyStats(subs) {
-      const stats = {};
-      subs.forEach(s => {
-          s.tags.forEach(tag => {
-              const key = `${tag}_${s.difficulty}`;
-              if (!stats[key]) stats[key] = { solved: new Set(), attempted: new Set(), wrong: 0 };
-              stats[key].attempted.add(s.problem);
-              if (s.status === "AC") stats[key].solved.add(s.problem);
-              else stats[key].wrong++;
-          });
+    // To track uniqueness
+    const attemptedProblemsTag = {};
+    const solvedProblemsTag = {};
+    const attemptedProblemsDiff = {};
+    const solvedProblemsDiff = {};
+
+    submissions.forEach(sub => {
+      const { problem, status, tags, difficulty } = sub;
+
+      // ---------- TAG STATS ----------
+      tags.forEach(tag => {
+        if (!tagStats[tag]) {
+          tagStats[tag] = { attempted: 0, solved: 0, totalSubs: 0, correctSubs: 0 };
+          attemptedProblemsTag[tag] = new Set();
+          solvedProblemsTag[tag] = new Set();
+        }
+
+        tagStats[tag].totalSubs++;
+        if (status === "AC") tagStats[tag].correctSubs++;
+
+        attemptedProblemsTag[tag].add(problem);
+        if (status === "AC") solvedProblemsTag[tag].add(problem);
       });
-      return stats;
+
+      // ---------- DIFFICULTY STATS ----------
+      if (!diffStats[difficulty]) {
+        diffStats[difficulty] = { attempted: 0, solved: 0, totalSubs: 0, correctSubs: 0 };
+        attemptedProblemsDiff[difficulty] = new Set();
+        solvedProblemsDiff[difficulty] = new Set();
+      }
+
+      diffStats[difficulty].totalSubs++;
+      if (status === "AC") diffStats[difficulty].correctSubs++;
+
+      attemptedProblemsDiff[difficulty].add(problem);
+      if (status === "AC") solvedProblemsDiff[difficulty].add(problem);
+    });
+
+    // Fill attempted & solved counts
+    for (let tag in tagStats) {
+      tagStats[tag].attempted = attemptedProblemsTag[tag].size;
+      tagStats[tag].solved = solvedProblemsTag[tag].size;
+    }
+
+    for (let diff in diffStats) {
+      diffStats[diff].attempted = attemptedProblemsDiff[diff].size;
+      diffStats[diff].solved = solvedProblemsDiff[diff].size;
+    }
+
+    return { tagStats, diffStats };
   }
 
-  function calcCombinedScore(stat) {
-      const solved = stat.solved.size;
-      const attempted = stat.attempted.size;
-      const attempt_fam = attempted ? solved / attempted : 0;
-      const coverage = 1; 
-      return alpha * attempt_fam + (1 - alpha) * coverage;
+  function computeScores(tagStats, diffStats, alpha = 0.6) { // Removed totalProblemsByTag, totalProblemsByDifficulty
+    const tagScores = {};
+    const diffScores = {};
+
+    for (let tag in tagStats) {
+      const fam = tagStats[tag].attempted > 0 ? tagStats[tag].solved / tagStats[tag].attempted : 0;
+      const cov = tagStats[tag].attempted > 0 ? 1 : 0; // Simplified coverage
+      const acc = tagStats[tag].totalSubs > 0 ? tagStats[tag].correctSubs / tagStats[tag].totalSubs : 0;
+
+      tagScores[tag] = {
+        familiarity: fam,
+        coverage: cov,
+        accuracy: acc,
+        score: alpha * fam + (1 - alpha) * cov
+      };
+    }
+
+    for (let diff in diffStats) {
+      const fam = diffStats[diff].attempted > 0 ? diffStats[diff].solved / diffStats[diff].attempted : 0;
+      const cov = diffStats[diff].attempted > 0 ? 1 : 0; // Simplified coverage
+      const acc = diffStats[diff].totalSubs > 0 ? diffStats[diff].correctSubs / diffStats[diff].totalSubs : 0;
+
+      diffScores[diff] = {
+        familiarity: fam,
+        coverage: cov,
+        accuracy: acc,
+        score: alpha * fam + (1 - alpha) * cov
+      };
+    }
+
+    return { tagScores, diffScores };
   }
 
-  function getDiffStats(subs) {
-      const stats = {};
-      subs.forEach(s => {
-          if (!stats[s.difficulty]) stats[s.difficulty] = { solved: new Set(), attempted: new Set(), wrong: 0 };
-          stats[s.difficulty].attempted.add(s.problem);
-          if (s.status === "AC") stats[s.difficulty].solved.add(s.problem);
-          else stats[s.difficulty].wrong++;
-      });
-      return stats;
-  }
+  // Main calculation steps:
 
-  function calcDiffScore(diffStat) {
-      const solved = diffStat.solved.size;
-      const attempted = diffStat.attempted.size;
-      const attempt_fam = attempted ? solved / attempted : 0;
-      const coverage = 1;
-      return beta * attempt_fam + (1 - beta) * coverage;
-  }
+  const { tagStats, diffStats } = calculateStats(submissions);
+  const { tagScores, diffScores } = computeScores(tagStats, diffStats);
 
-  function calcMyAcceptance(totalSolved, totalAttempted, totalWrong) {
-      const myAcc = (totalSolved + smoothing) / (totalAttempted + 2 * smoothing);
-      const avgWrong = totalAttempted ? totalWrong / totalAttempted : 0;
-      const penalty = 1 / (1 + gamma * avgWrong);
-      return myAcc * penalty;
-  }
-  // --- End of Calculation Functions ---
-
-  const tagDifficultyStats = getTagDifficultyStats(submissions);
-  const combinedScores = {};
-  for (const key in tagDifficultyStats) {
-      combinedScores[key] = calcCombinedScore(tagDifficultyStats[key]);
-  }
-
-  const diffStats = getDiffStats(submissions);
-  const diffScoresCalculated = {};
-  for (const diff in diffStats) {
-      diffScoresCalculated[diff] = calcDiffScore(diffStats[diff]);
-  }
-
-  const allSolvedCount = uniqueProblems(submissions.filter(s => s.status === "AC")).length;
-  const allAttemptedCount = uniqueProblems(submissions).length;
+  const allSolvedCount = new Set(submissions.filter(s => s.status === "AC").map(s => s.problem)).size;
+  const allAttemptedCount = new Set(submissions.map(s => s.problem)).size;
   const allWrongCount = submissions.filter(s => s.status !== "AC").length;
-  const myAccAdj = calcMyAcceptance(allSolvedCount, allAttemptedCount, allWrongCount);
+
+  const myAccAdj = ((allSolvedCount + 1) / (allAttemptedCount + 2)); // Simple Acceptance rate with smoothing
 
   const currentProblemTags = probData.topicTags.map(t => t.name);
   const currentProblemDifficulty = probData.difficulty;
 
-  let avgTagDifficultyScoreForCurrentProblem = 0;
-  if (currentProblemTags.length > 0) {
-      let sumScores = 0;
-      currentProblemTags.forEach(tag => {
-          const key = `${tag}_${currentProblemDifficulty}`;
-          sumScores += (combinedScores[key] || 0);
-      });
-      avgTagDifficultyScoreForCurrentProblem = sumScores / currentProblemTags.length;
+  let avgTagScoreForCurrentProblem = 0;
+  let tagTotalsForDisplay = [];
+  if (probData.topicTags.length > 0) {
+    // Refresh per-topic solved/total for the current problem's tags
+    await updateUserTopicProgressForTags(probData.topicTags);
+    const alphaForTagScore = 0.6;
+    const storageKeys = [];
+    probData.topicTags.forEach(t => {
+      storageKeys.push(`tagTotal_${t.slug}`);
+      storageKeys.push(`tagSolved_${t.slug}`);
+      storageKeys.push(`tagTotalsByDiff_${t.slug}`);
+    });
+
+    const stored = await new Promise(resolve => {
+      try {
+        chrome.storage.local.get(storageKeys, (items) => resolve(items || {}));
+      } catch (e) {
+        resolve({});
+      }
+    });
+
+    let sumScores = 0;
+    probData.topicTags.forEach(t => {
+      const name = t.name;
+      const slug = t.slug;
+      const stats = tagStats[name] || { attempted: 0, solved: 0 };
+      const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
+
+      const totalKey = `tagTotal_${slug}`;
+      const solvedKey = `tagSolved_${slug}`;
+      const byDiffKey = `tagTotalsByDiff_${slug}`;
+      const total = stored[totalKey];
+      const solved = stored[solvedKey];
+      const byDiff = stored[byDiffKey];
+
+      tagTotalsForDisplay.push({ name, slug, total, solved, byDiff });
+
+      let coverage;
+      if (typeof total === 'number' && total > 0 && typeof solved === 'number') {
+        coverage = Math.min(1, Math.max(0, solved / total));
+      } else {
+        // Smoothed fallback to avoid overconfidence with very few attempts
+        coverage = (stats.attempted + 2) > 0 ? (stats.solved + 1) / (stats.attempted + 2) : 0;
+      }
+
+      const score = alphaForTagScore * fam + (1 - alphaForTagScore) * coverage;
+      sumScores += score;
+    });
+
+    avgTagScoreForCurrentProblem = sumScores / probData.topicTags.length;
   }
 
-  const overallDifficultyScoreForCurrentProblem = diffScoresCalculated[currentProblemDifficulty] || 0;
+  const overallDifficultyScoreForCurrentProblem = diffScores[currentProblemDifficulty]?.score || 0;
 
-  const P = W1 * avgTagDifficultyScoreForCurrentProblem +
+  const W1 = 0.4, W2 = 0.4, W3 = 0.2; // Adjusted weights
+
+  const P = W1 * avgTagScoreForCurrentProblem +
             W2 * overallDifficultyScoreForCurrentProblem +
             W3 * myAccAdj;
 
@@ -343,36 +456,63 @@ async function calculateAndDisplayAccuracy() {
         wrongSubmissions: allWrongCount,
         myAcceptanceAdjusted: myAccAdj.toFixed(3)
     },
-    tagDifficultyPerformance: Object.keys(tagDifficultyStats)
-        .filter(key => {
-            const [tag, diff] = key.split('_');
-            return currentProblemTags.includes(tag) && diff === currentProblemDifficulty;
-        })
-        .map(key => {
-            const [tag, difficulty] = key.split('_');
-            const stat = tagDifficultyStats[key];
+    tagPerformance: Object.keys(tagScores)
+        .filter(tag => currentProblemTags.includes(tag))
+        .map(tag => {
+            const fam = tagScores[tag].familiarity;
+            const acc = tagScores[tag].accuracy;
+            const fromTotals = (tagTotalsForDisplay || []).find(t => t.name === tag);
+            let cov;
+            if (fromTotals && typeof fromTotals.total === 'number' && fromTotals.total > 0 && typeof fromTotals.solved === 'number') {
+              cov = Math.min(1, Math.max(0, fromTotals.solved / fromTotals.total));
+            } else {
+              // fallback to previous simple coverage if totals unavailable
+              cov = tagScores[tag].coverage;
+            }
+            const alphaForTagScore = 0.6;
+            const sc = alphaForTagScore * fam + (1 - alphaForTagScore) * cov;
             return {
-                tag,
-                difficulty,
-                solved: stat.solved.size,
-                attempted: stat.attempted.size,
-                wrong: stat.wrong,
-                score: calcCombinedScore(stat).toFixed(3)
+              tag,
+              familiarity: fam.toFixed(3),
+              coverage: cov.toFixed(3),
+              accuracy: acc.toFixed(3),
+              score: sc.toFixed(3)
             };
-        }).sort((a, b) => b.score - a.score),
-    difficultyPerformance: Object.keys(diffStats).map(diff => ({
+        }).sort((a, b) => b.score - a.score), 
+    difficultyPerformance: Object.keys(diffScores).map(diff => ({
       difficulty: diff,
-      solved: diffStats[diff].solved.size,
-      attempted: diffStats[diff].attempted.size,
-      wrong: diffStats[diff].wrong,
-      score: diffScoresCalculated[diff].toFixed(3)
+      familiarity: diffScores[diff].familiarity.toFixed(3),
+      coverage: diffScores[diff].coverage.toFixed(3),
+      accuracy: diffScores[diff].accuracy.toFixed(3),
+      score: diffScores[diff].score.toFixed(3)
     })).sort((a, b) => b.score - a.score),
     calculatedScoresForCurrentProblem: {
-        avgTagDifficultyScore: avgTagDifficultyScoreForCurrentProblem.toFixed(3),
+        avgTagScore: avgTagScoreForCurrentProblem.toFixed(3),
         overallDifficultyScore: overallDifficultyScoreForCurrentProblem.toFixed(3)
     },
+    tagTotals: tagTotalsForDisplay,
     probability: (P * 100).toFixed(2) + "%"
   };
+
+  // Print topic totals to console (DevTools)
+  const tagTotalsConsoleText = (tagTotalsForDisplay || [])
+    .filter(t => typeof t.total === 'number' && typeof t.solved === 'number')
+    .map(t => {
+      const parts = [`${t.name}: ${t.solved}/${t.total}`];
+      const d = t.byDiff || {};
+      const fmt = (x) => typeof x === 'number' ? x : 0;
+      if (d.Easy || d.Medium || d.Hard) {
+        const e = d.Easy || {}; const m = d.Medium || {}; const h = d.Hard || {};
+        parts.push(`(E ${fmt(e.solved)}/${fmt(e.total)} • M ${fmt(m.solved)}/${fmt(m.total)} • H ${fmt(h.solved)}/${fmt(h.total)})`);
+      }
+      return parts.join(' ');
+    })
+    .join(' | ');
+  if (tagTotalsConsoleText) {
+    console.log(`Topic totals: ${tagTotalsConsoleText}`);
+  } else {
+    console.log('Topic totals: none available (use the popup to fetch tag problems for these topics).');
+  }
 
   // Inject the result directly into the LeetCode page DOM
   const problemTitleContainer = document.querySelector('div.text-title-large');
@@ -391,6 +531,35 @@ async function calculateAndDisplayAccuracy() {
         problemLinkElement.parentNode.insertBefore(probDisplay, problemLinkElement.nextSibling);
       }
       probDisplay.textContent = `${result.probability}`;
+
+      // Add/Update tag totals display
+      let tagTotalsEl = document.getElementById('leetcode-tag-totals');
+      const tagTotalsText = (tagTotalsForDisplay || [])
+        .filter(t => typeof t.total === 'number' && typeof t.solved === 'number')
+        .map(t => {
+          const base = `${t.name}: ${t.solved}/${t.total}`;
+          const d = t.byDiff || {};
+          const fmt = (x) => typeof x === 'number' ? x : 0;
+          if (d.Easy || d.Medium || d.Hard) {
+            const e = d.Easy || {}; const m = d.Medium || {}; const h = d.Hard || {};
+            return `${base} (E ${fmt(e.solved)}/${fmt(e.total)} • M ${fmt(m.solved)}/${fmt(m.total)} • H ${fmt(h.solved)}/${fmt(h.total)})`;
+          }
+          return base;
+        })
+        .join(' | ');
+
+      if (tagTotalsText) {
+        if (!tagTotalsEl) {
+          tagTotalsEl = document.createElement('span');
+          tagTotalsEl.id = 'leetcode-tag-totals';
+          tagTotalsEl.style.marginLeft = '10px';
+          tagTotalsEl.style.fontSize = '14px';
+          tagTotalsEl.style.color = '#9aa0a6';
+          problemLinkElement.parentNode.insertBefore(tagTotalsEl, probDisplay.nextSibling);
+        }
+        tagTotalsEl.textContent = tagTotalsText;
+        tagTotalsEl.title = 'Per-topic solved/total and difficulty split based on fetched tag lists';
+      }
     } else {
       console.warn("Could not find the problem link element within the title container.");
     }
@@ -402,67 +571,193 @@ async function calculateAndDisplayAccuracy() {
   console.log("Note: Accuracy is based on your submitted problems' history only. 'Coverage' metrics assume you've attempted all problems in a category since global problem counts are not used.");
 }
 
-// --- Message Listener from Popup (mostly for initial manual trigger/debugging) ---
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  (async () => {
-    if (message.action === "getUserStats") {
-      // This action now primarily used for getting username, if needed by popup
-      const username = await fetchCurrentUsername();
-      if (username) {
-        // You could also store username in storage here if needed for other parts
-        sendResponse({ success: true, data: { username: username } });
-      } else {
-        sendResponse({ success: false, error: "Not signed in to LeetCode." });
-      }
-    } else if (message.action === "getAllProblems") {
-      // This is no longer primarily used, as problem details are fetched on demand.
-      // But if user clicks it, we can fetch all for debugging/display.
-      console.warn("'Fetch All Problems' button is deprecated in this version. Not fetching all problems.");
-      sendResponse({ success: true, data: { total: 0, questions: [] } });
-    } else if (message.action === "getRecentAccepted") {
-      // This is also deprecated for core calculation, as we use getAllSubmissions.
-      console.warn("'Fetch Recent ACs' button is deprecated in this version. Not fetching recent ACs.");
-      sendResponse({ success: true, data: { data: { recentAcSubmissionList: [] } } });
-    } else if (message.action === "getAllSubmissions") {
-      try {
-        console.log("Fetching all submissions via popup request...");
-        const submissions = await fetchAllSubmissions();
-        sendResponse({ success: true, data: submissions });
-      } catch (err) {
-        console.error("Error fetching all submissions from content script:", err);
-        sendResponse({ success: false, error: String(err) });
-      }
-    } else if (message.action === "getCurrentProblemDetails") {
-      // This action is now handled internally by calculateAndDisplayAccuracy
-      const titleSlug = getCurrentProblemDetailsFromURL();
-      if (titleSlug) {
-        try {
-          const query = `
-            query getQuestionDetail($titleSlug: String!) {
-              question(titleSlug: $titleSlug) {
-                questionId
-                title
-                titleSlug
-                difficulty
-                topicTags { name slug }
-              }
+// Listen for messages from the popup or background script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    (async () => {
+        if (request.action === "getUserStats") {
+            try {
+                const username = await fetchCurrentUsername();
+                sendResponse({ success: true, data: { username } });
+            } catch (error) {
+                console.error("Error in getUserStats:", error);
+                sendResponse({ success: false, error: error.message });
             }
-          `;
-          const data = await fetchLeetCodeGraphQL(query, { titleSlug });
-          sendResponse({ success: true, data });
-        } catch (err) {
-          sendResponse({ success: false, error: String(err) });
+        } else if (request.action === "getAllSubmissions") {
+            try {
+                const submissions = await fetchAllSubmissions();
+                sendResponse({ success: true, data: submissions });
+            } catch (error) {
+                console.error("Error in getAllSubmissions:", error);
+                sendResponse({ success: false, error: error.message });
+            }
+        } else if (request.action === "fetchAndCacheProblemDetailsForSlugs") {
+            try {
+                const cache = await fetchAndCacheProblemDetailsForSlugs(request.slugs);
+                sendResponse({ success: true, data: cache });
+            } catch (error) {
+                console.error("Error in fetchAndCacheProblemDetailsForSlugs:", error);
+                sendResponse({ success: false, error: error.message });
+            }
+        } else if (request.action === "getCurrentProblemDetails") {
+            try {
+                const currentProblemSlug = getCurrentProblemDetailsFromURL();
+                if (currentProblemSlug) {
+                    const query = `
+                        query getQuestionDetail($titleSlug: String!) {
+                            question(titleSlug: $titleSlug) {
+                                questionId
+                                title
+                                titleSlug
+                                difficulty
+                                topicTags { name slug }
+                            }
+                        }
+                    `;
+                    const resp = await fetchLeetCodeGraphQL(query, { titleSlug: currentProblemSlug });
+                    sendResponse({ success: true, data: resp.data });
+                } else {
+                    sendResponse({ success: false, error: "Not on a LeetCode problem page." });
+                }
+            } catch (error) {
+                console.error("Error in getCurrentProblemDetails:", error);
+                sendResponse({ success: false, error: error.message });
+            }
+        } else if (request.action === "calculateProbability") {
+            // This action now triggers the main calculation logic
+            // The result is logged to console and not explicitly sent back as a response
+            // because this is a more complex, multi-step process.
+            calculateAndDisplayAccuracy();
+            sendResponse({ success: true }); // Indicate that calculation has started
+        } else if (request.action === "refreshUserTopicProgress") {
+            try {
+                const tags = request.tags || [];
+                await updateUserTopicProgressForTags(tags);
+                sendResponse({ success: true });
+            } catch (error) {
+                console.error('Error in refreshUserTopicProgress:', error);
+                sendResponse({ success: false, error: error.message });
+            }
+        } else if (request.action === "getProblemsByTag") {
+            try {
+                const inputTag = (request.tag || "").trim();
+                if (!inputTag) {
+                    sendResponse({ success: false, error: "No tag provided." });
+                    return;
+                }
+                const aliasMap = {
+                    dp: "dynamic-programming",
+                    bfs: "breadth-first-search",
+                    dfs: "depth-first-search",
+                    bs: "binary-search",
+                    ll: "linked-list",
+                    bt: "backtracking",
+                    trie: "trie",
+                    heap: "heap",
+                    math: "math",
+                    graph: "graph",
+                    graphs: "graph"
+                };
+                const normalizedSlug = (aliasMap[inputTag.toLowerCase()]) || inputTag
+                    .toLowerCase()
+                    .replace(/[^a-z0-9\s-]/g, "")
+                    .replace(/\s+/g, "-")
+                    .replace(/-+/g, "-")
+                    .trim();
+
+                const query = `
+                  query problemsetQuestionListV2($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionFilterInput) {
+                    problemsetQuestionListV2(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+                      total
+                      questions {
+                        difficulty
+                        questionFrontendId
+                        paidOnly
+                        title
+                        titleSlug
+                        acRate
+                        status
+                        topicTags { name slug }
+                      }
+                    }
+                  }
+                `;
+                const variables = {
+                  categorySlug: "",
+                  filters: { topicSlugs: [normalizedSlug] },
+                  skip: 0,
+                  limit: 5000
+                };
+                const data = await fetchLeetCodeGraphQL(query, variables);
+                const totalLength = data.data.problemsetQuestionListV2.total;
+                const questions = data.data.problemsetQuestionListV2.questions;
+
+                // Compute per-difficulty solved/total
+                const byDiff = { Easy: { total: 0, solved: 0 }, Medium: { total: 0, solved: 0 }, Hard: { total: 0, solved: 0 } };
+                (questions || []).forEach(q => {
+                  if (!byDiff[q.difficulty]) return;
+                  byDiff[q.difficulty].total += 1;
+                  if ((q.status || "").toUpperCase() === "AC") byDiff[q.difficulty].solved += 1;
+                });
+
+                // Persist for reuse
+                await new Promise(resolve => chrome.storage.local.set({ [`tagProblems_${normalizedSlug}`]: questions }, resolve));
+                await new Promise(resolve => chrome.storage.local.set({ [`tagTotal_${normalizedSlug}`]: totalLength }, resolve));
+                await new Promise(resolve => chrome.storage.local.set({ [`tagTotalsByDiff_${normalizedSlug}`]: byDiff }, resolve));
+                await new Promise(resolve => chrome.storage.local.set({ [`tagSolved_${normalizedSlug}`]: (questions || []).filter(q => (q.status || "").toUpperCase() === "AC").length }, resolve));
+
+                sendResponse({ success: true, data: { slug: normalizedSlug, totalLength, questions, byDifficulty: byDiff } });
+            } catch (error) {
+                console.error("Error in getProblemsByTag:", error);
+                sendResponse({ success: false, error: error.message });
+            }
+        } else if (request.action === "GET_TAG_PROBLEMS") {
+            try {
+                const tagSlug = request.tagSlug;
+                if (!tagSlug) {
+                    sendResponse({ success: false, error: "No tagSlug provided." });
+                    return;
+                }
+                const query = `
+                  query problemsetQuestionListV2($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionFilterInput) {
+                    problemsetQuestionListV2(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+                      total
+                      questions {
+                        difficulty
+                        questionFrontendId
+                        paidOnly
+                        title
+                        titleSlug
+                        acRate
+                        status
+                        topicTags { name slug }
+                      }
+                    }
+                  }
+                `;
+                const variables = {
+                  categorySlug: "",
+                  filters: { topicSlugs: [tagSlug] },
+                  skip: 0,
+                  limit: 5000
+                };
+                const data = await fetchLeetCodeGraphQL(query, variables);
+                const totalLength = data.data.problemsetQuestionListV2.total;
+                const questions = data.data.problemsetQuestionListV2.questions;
+                const byDiff = { Easy: { total: 0, solved: 0 }, Medium: { total: 0, solved: 0 }, Hard: { total: 0, solved: 0 } };
+                (questions || []).forEach(q => {
+                  if (!byDiff[q.difficulty]) return;
+                  byDiff[q.difficulty].total += 1;
+                  if ((q.status || "").toUpperCase() === "AC") byDiff[q.difficulty].solved += 1;
+                });
+                const payload = { totalLength, questions, byDifficulty: byDiff };
+                sendResponse({ success: true, data: payload });
+            } catch (error) {
+                console.error("Error in GET_TAG_PROBLEMS:", error);
+                sendResponse({ success: false, error: error.message });
+            }
         }
-      } else {
-        sendResponse({ success: false, error: "Not on a problem page." });
-      }
-    } else if (message.action === "calculateProbability") {
-      // Trigger calculation from popup
-      calculateAndDisplayAccuracy();
-      sendResponse({ success: true });
-    }
-  })();
-  return true;
+    })();
+    return true; // Keep the message channel open for sendResponse
 });
 
 // --- Auto-trigger on page load ---
