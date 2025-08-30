@@ -1,5 +1,9 @@
 // content.js
-
+const WEIGHTS = {
+  tag: { fam: 0.5, cov: 0.3, acc: 0.2 },
+  diff: { fam: 0.5, cov: 0.3, acc: 0.2 },
+  final: { W1: 0.3, W2: 0.3, W3: 0.4 }
+};
 console.log('LeetCode Topic Accuracy content script injected.');
 
 const LEETCODE_GRAPHQL = 'https://leetcode.com/graphql/';
@@ -80,46 +84,6 @@ async function fetchAndCacheProblemDetailsForSlugs(slugsToFetch) {
   return currentCache;
 }
 
-// --- NEW: Compute and cache global difficulty totals (Easy/Medium/Hard) ---
-async function updateGlobalDifficultyTotals() {
-  try {
-    console.log('[Accuracy] Fetching global difficulty totals...');
-    const query = `
-      query problemsetQuestionListV2($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionFilterInput) {
-        problemsetQuestionListV2(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
-          total
-          questions {
-            difficulty
-            questionFrontendId
-            paidOnly
-            title
-            titleSlug
-            acRate
-            status
-            topicTags { name slug }
-          }
-        }
-      }
-    `;
-    const variables = { categorySlug: "", filters: {}, skip: 0, limit: 5000 };
-    const data = await fetchLeetCodeGraphQL(query, variables);
-    const questions = (data && data.data && data.data.problemsetQuestionListV2 && data.data.problemsetQuestionListV2.questions) || [];
-
-    const totals = { Easy: 0, Medium: 0, Hard: 0 };
-    questions.forEach(q => {
-      if (q && q.difficulty && totals.hasOwnProperty(q.difficulty)) {
-        totals[q.difficulty] += 1;
-      }
-    });
-
-    await chrome.storage.local.set({ globalTotalsByDiff: totals });
-    console.log('[Accuracy] Global difficulty totals updated:', totals);
-    return totals;
-  } catch (e) {
-    console.error('Failed to update global difficulty totals:', e);
-    return null;
-  }
-}
 
 // --- NEW: Compute and cache global difficulty totals and solved counts (Easy/Medium/Hard) via questionList ---
 async function updateGlobalDifficultyTotalsAndSolved() {
@@ -252,6 +216,26 @@ async function updateUserTopicProgressForTags(topicTags) {
     console.warn('Failed to update user topic progress:', e);
   }
 }
+
+let tagTotalsForDisplay = [];
+let avgTagScoreForCurrentProblem = 0;
+if (probData.topicTags.length > 0) {
+  let aiCombos = [];
+  try {
+    aiCombos = await fetchTagCombinationsFromAI(probData.title, probData.topicTags.map(t => t.name));
+    console.log("AI combos fetched:", aiCombos);
+      // --- Add this ---
+  const userTagProgress = await fetchUserTopicProgress();
+   tagTotalsForDisplay = userTagProgress.map(i => ({
+    name: i.name,
+    slug: i.slug,
+    total: i.totalNum,
+    solved: i.finishedNum
+  }));
+
+  } catch (err) {
+    console.warn("Failed to fetch AI tag combinations:", err);
+  }
 
 // --- Core Calculation Logic (Moved from popup.js, slightly adapted) ---
 async function calculateAndDisplayAccuracy() {
@@ -424,10 +408,13 @@ async function calculateAndDisplayAccuracy() {
       const fam = tagStats[tag].attempted > 0 ? tagStats[tag].solved / tagStats[tag].attempted : 0;
       const cov = tagStats[tag].attempted > 0 ? 1 : 0; // Simplified coverage (display adjusted later)
       const acc = tagStats[tag].totalSubs > 0 ? tagStats[tag].correctSubs / tagStats[tag].totalSubs : 0;
+      // Get global totals for this tag
+      const totals = tagTotalsForDisplay.find(t => t.name === tag);
+      const completion = totals && totals.total > 0 ? totals.solved / totals.total : 0;
 
       tagScores[tag] = {
         familiarity: fam,
-        coverage: cov,
+        coverage: completion,
         accuracy: acc,
         score: alpha * fam + (1 - alpha) * cov
       };
@@ -485,6 +472,7 @@ async function calculateAndDisplayAccuracy() {
 
   const { tagStats, diffStats } = calculateStats(submissions);
 
+
   // Ensure we have global difficulty totals and solved counts
   // Always fetch fresh to avoid stale cache affecting calculations
   let fetchedTotalsSolved = await updateGlobalDifficultyTotalsAndSolved();
@@ -502,59 +490,41 @@ async function calculateAndDisplayAccuracy() {
   const currentProblemTags = probData.topicTags.map(t => t.name);
   const currentProblemDifficulty = probData.difficulty;
 
-  let avgTagScoreForCurrentProblem = 0;
-  let tagTotalsForDisplay = [];
-  if (probData.topicTags.length > 0) {
-    // Refresh per-topic solved/total for the current problem's tags
-    await updateUserTopicProgressForTags(probData.topicTags);
-    const alphaForTagScore = 0.6;
-    const storageKeys = [];
-    probData.topicTags.forEach(t => {
-      storageKeys.push(`tagTotal_${t.slug}`);
-      storageKeys.push(`tagSolved_${t.slug}`);
-      storageKeys.push(`tagTotalsByDiff_${t.slug}`);
-    });
 
-    const stored = await new Promise(resolve => {
-      try {
-        chrome.storage.local.get(storageKeys, (items) => resolve(items || {}));
-      } catch (e) {
-        resolve({});
-      }
-    });
-
+  const validCombos = (aiCombos || []).filter(c => Array.isArray(c) && c.length > 0);
+  if (validCombos.length > 0) {
+    const comboScores = validCombos.map(c => computeComboScoreWithOriginalFormula(c, tagStats, tagTotalsForDisplay));
+    avgTagScoreForCurrentProblem = Math.max(...comboScores); // pick the best combo
+  } else {
+    // fallback to simple average over all tags (your original method)
+    // fallback to simple average over all tags
     let sumScores = 0;
-    probData.topicTags.forEach(t => {
-      const name = t.name;
-      const slug = t.slug;
-      const stats = tagStats[name] || { attempted: 0, solved: 0 };
-      const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
+    for (const t of probData.topicTags) {
+        const stats = tagStats[t.name] || { attempted: 0, solved: 0 };
+        const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
+        const acc = stats.totalSubs > 0 ? stats.correctSubs / stats.totalSubs : 0;
 
-      const totalKey = `tagTotal_${slug}`;
-      const solvedKey = `tagSolved_${slug}`;
-      const byDiffKey = `tagTotalsByDiff_${slug}`;
+        // --- NEW: Fetch global total and user solved for this tag ---
+        const globalTotal = await fetchGlobalProblemsByTag(t.slug); // returns total problems for this tag
+        const userSolved = stats.solved;
+        const solvedRatio = globalTotal > 0 ? userSolved / globalTotal : 0;
 
-      const total = stored[totalKey];
-      const solved = stored[solvedKey];
-      const byDiff = stored[byDiffKey];
+        // --- Combine factors ---
+        const alpha = 0.5; // familiarity weight
+        const beta = 0.3;  // solved/global weight
+        const gamma = 0.2; // accuracy weight
+        const score = alpha * fam + beta * solvedRatio + gamma * acc;
 
-      tagTotalsForDisplay.push({ name, slug, total, solved, byDiff });
-
-      let coverage;
-      if (typeof total === 'number' && total > 0 && typeof solved === 'number') {
-        coverage = Math.min(1, Math.max(0, solved / total));
-      } else {
-        // Smoothed fallback to avoid overconfidence with very few attempts
-        coverage = (stats.attempted + 2) > 0 ? (stats.solved + 1) / (stats.attempted + 2) : 0;
-      }
-
-      const score = alphaForTagScore * fam + (1 - alphaForTagScore) * coverage;
-      sumScores += score;
-    });
+        sumScores += score;
+    }
 
     avgTagScoreForCurrentProblem = sumScores / probData.topicTags.length;
-  }
 
+  }
+}
+
+  
+ 
   const overallDifficultyScoreForCurrentProblem = diffScores[currentProblemDifficulty]?.score || 0;
 
   const W1 = 0.4, W2 = 0.4, W3 = 0.2; // Adjusted weights
@@ -648,34 +618,6 @@ async function calculateAndDisplayAccuracy() {
       }
       probDisplay.textContent = `${result.probability}`;
 
-      // Add/Update tag totals display
-      // let tagTotalsEl = document.getElementById('leetcode-tag-totals');
-      // const tagTotalsText = (tagTotalsForDisplay || [])
-      //   .filter(t => typeof t.total === 'number' && typeof t.solved === 'number')
-      //   .map(t => {
-      //     const base = `${t.name}: ${t.solved}/${t.total}`;
-      //     const d = t.byDiff || {};
-      //     const fmt = (x) => typeof x === 'number' ? x : 0;
-      //     if (d.Easy || d.Medium || d.Hard) {
-      //       const e = d.Easy || {}; const m = d.Medium || {}; const h = d.Hard || {};
-      //       return `${base} (E ${fmt(e.solved)}/${fmt(e.total)} • M ${fmt(m.solved)}/${fmt(m.total)} • H ${fmt(h.solved)}/${fmt(h.total)})`;
-      //     }
-      //     return base;
-      //   })
-      //   .join(' | ');
-
-      // if (tagTotalsText) {
-      //   if (!tagTotalsEl) {
-      //     tagTotalsEl = document.createElement('span');
-      //     tagTotalsEl.id = 'leetcode-tag-totals';
-      //     tagTotalsEl.style.marginLeft = '10px';
-      //     tagTotalsEl.style.fontSize = '14px';
-      //     tagTotalsEl.style.color = '#9aa0a6';
-      //     problemLinkElement.parentNode.insertBefore(tagTotalsEl, probDisplay.nextSibling);
-      //   }
-      //   tagTotalsEl.textContent = tagTotalsText;
-      //   tagTotalsEl.title = 'Per-topic solved/total and difficulty split based on fetched tag lists';
-      // }
     } else {
       console.warn("Could not find the problem link element within the title container.");
     }
@@ -687,194 +629,111 @@ async function calculateAndDisplayAccuracy() {
   console.log("Note: Accuracy is based on your submitted problems' history only. 'Coverage' metrics assume you've attempted all problems in a category since global problem counts are not used.");
 }
 
-// Listen for messages from the popup or background script
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    (async () => {
-        if (request.action === "getUserStats") {
-            try {
-                const username = await fetchCurrentUsername();
-                sendResponse({ success: true, data: { username } });
-            } catch (error) {
-                console.error("Error in getUserStats:", error);
-                sendResponse({ success: false, error: error.message });
-            }
-        } else if (request.action === "getAllSubmissions") {
-            try {
-                const submissions = await fetchAllSubmissions();
-                sendResponse({ success: true, data: submissions });
-            } catch (error) {
-                console.error("Error in getAllSubmissions:", error);
-                sendResponse({ success: false, error: error.message });
-            }
-        } else if (request.action === "fetchAndCacheProblemDetailsForSlugs") {
-            try {
-                const cache = await fetchAndCacheProblemDetailsForSlugs(request.slugs);
-                sendResponse({ success: true, data: cache });
-            } catch (error) {
-                console.error("Error in fetchAndCacheProblemDetailsForSlugs:", error);
-                sendResponse({ success: false, error: error.message });
-            }
-        } else if (request.action === "getCurrentProblemDetails") {
-            try {
-                const currentProblemSlug = getCurrentProblemDetailsFromURL();
-                if (currentProblemSlug) {
-                    const query = `
-                        query getQuestionDetail($titleSlug: String!) {
-                            question(titleSlug: $titleSlug) {
-                                questionId
-                                title
-                                titleSlug
-                                difficulty
-                                topicTags { name slug }
-                            }
-                        }
-                    `;
-                    const resp = await fetchLeetCodeGraphQL(query, { titleSlug: currentProblemSlug });
-                    sendResponse({ success: true, data: resp.data });
-                } else {
-                    sendResponse({ success: false, error: "Not on a LeetCode problem page." });
-                }
-            } catch (error) {
-                console.error("Error in getCurrentProblemDetails:", error);
-                sendResponse({ success: false, error: error.message });
-            }
-        } else if (request.action === "calculateProbability") {
-            // This action now triggers the main calculation logic
-            // The result is logged to console and not explicitly sent back as a response
-            // because this is a more complex, multi-step process.
-            calculateAndDisplayAccuracy();
-            sendResponse({ success: true }); // Indicate that calculation has started
-        } else if (request.action === "refreshUserTopicProgress") {
-            try {
-                const tags = request.tags || [];
-                await updateUserTopicProgressForTags(tags);
-                sendResponse({ success: true });
-            } catch (error) {
-                console.error('Error in refreshUserTopicProgress:', error);
-                sendResponse({ success: false, error: error.message });
-            }
-        } else if (request.action === "getProblemsByTag") {
-            try {
-                const inputTag = (request.tag || "").trim();
-                if (!inputTag) {
-                    sendResponse({ success: false, error: "No tag provided." });
-                    return;
-                }
-                const aliasMap = {
-                    dp: "dynamic-programming",
-                    bfs: "breadth-first-search",
-                    dfs: "depth-first-search",
-                    bs: "binary-search",
-                    ll: "linked-list",
-                    bt: "backtracking",
-                    trie: "trie",
-                    heap: "heap",
-                    math: "math",
-                    graph: "graph",
-                    graphs: "graph"
-                };
-                const normalizedSlug = (aliasMap[inputTag.toLowerCase()]) || inputTag
-                    .toLowerCase()
-                    .replace(/[^a-z0-9\s-]/g, "")
-                    .replace(/\s+/g, "-")
-                    .replace(/-+/g, "-")
-                    .trim();
+function parseAIResponse(rawText) {
+  let cleaned = rawText.trim();
+  if (cleaned.startsWith("```json")) cleaned = cleaned.replace(/^```json\s*/, '');
+  if (cleaned.endsWith("```")) cleaned = cleaned.replace(/```$/, '');
+  return JSON.parse(cleaned);
+}
 
-                const query = `
-                  query problemsetQuestionListV2($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionFilterInput) {
-                    problemsetQuestionListV2(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
-                      total
-                      questions {
-                        difficulty
-                        questionFrontendId
-                        paidOnly
-                        title
-                        titleSlug
-                        acRate
-                        status
-                        topicTags { name slug }
-                      }
-                    }
-                  }
-                `;
-                const variables = {
-                  categorySlug: "",
-                  filters: { topicSlugs: [normalizedSlug] },
-                  skip: 0,
-                  limit: 5000
-                };
-                const data = await fetchLeetCodeGraphQL(query, variables);
-                const totalLength = data.data.problemsetQuestionListV2.total;
-                const questions = data.data.problemsetQuestionListV2.questions;
+async function fetchTagCombinationsFromAI(problemName, tags) {
+  const prompt = `
+Problem: "${problemName}"
+Tags: [${tags.map(t => `"${t}"`).join(", ")}]
 
-                // Compute per-difficulty solved/total
-                const byDiff = { Easy: { total: 0, solved: 0 }, Medium: { total: 0, solved: 0 }, Hard: { total: 0, solved: 0 } };
-                (questions || []).forEach(q => {
-                  if (!byDiff[q.difficulty]) return;
-                  byDiff[q.difficulty].total += 1;
-                  if ((q.status || "").toUpperCase() === "AC") byDiff[q.difficulty].solved += 1;
-                });
+Suggest all useful tag combinations a user can solve this problem with.
+Include single tags and multiple-tag combinations.
+Return ONLY as a JSON array of arrays. Example:
+[["arrays"], ["arrays", "sliding window"], ["arrays","hashtable"]]
+`;
 
-                // Persist for reuse
-                await new Promise(resolve => chrome.storage.local.set({ [`tagProblems_${normalizedSlug}`]: questions }, resolve));
-                await new Promise(resolve => chrome.storage.local.set({ [`tagTotal_${normalizedSlug}`]: totalLength }, resolve));
-                await new Promise(resolve => chrome.storage.local.set({ [`tagTotalsByDiff_${normalizedSlug}`]: byDiff }, resolve));
-                await new Promise(resolve => chrome.storage.local.set({ [`tagSolved_${normalizedSlug}`]: (questions || []).filter(q => (q.status || "").toUpperCase() === "AC").length }, resolve));
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ type: 'ai_prompt', prompt }, (response) => {
+      if (!response?.success) return reject(new Error(response?.error || "Unknown AI error"));
 
-                sendResponse({ success: true, data: { slug: normalizedSlug, totalLength, questions, byDifficulty: byDiff } });
-            } catch (error) {
-                console.error("Error in getProblemsByTag:", error);
-                sendResponse({ success: false, error: error.message });
-            }
-        } else if (request.action === "GET_TAG_PROBLEMS") {
-            try {
-                const tagSlug = request.tagSlug;
-                if (!tagSlug) {
-                    sendResponse({ success: false, error: "No tagSlug provided." });
-                    return;
-                }
-                const query = `
-                  query problemsetQuestionListV2($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionFilterInput) {
-                    problemsetQuestionListV2(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
-                      total
-                      questions {
-                        difficulty
-                        questionFrontendId
-                        paidOnly
-                        title
-                        titleSlug
-                        acRate
-                        status
-                        topicTags { name slug }
-                      }
-                    }
-                  }
-                `;
-                const variables = {
-                  categorySlug: "",
-                  filters: { topicSlugs: [tagSlug] },
-                  skip: 0,
-                  limit: 5000
-                };
-                const data = await fetchLeetCodeGraphQL(query, variables);
-                const totalLength = data.data.problemsetQuestionListV2.total;
-                const questions = data.data.problemsetQuestionListV2.questions;
-                const byDiff = { Easy: { total: 0, solved: 0 }, Medium: { total: 0, solved: 0 }, Hard: { total: 0, solved: 0 } };
-                (questions || []).forEach(q => {
-                  if (!byDiff[q.difficulty]) return;
-                  byDiff[q.difficulty].total += 1;
-                  if ((q.status || "").toUpperCase() === "AC") byDiff[q.difficulty].solved += 1;
-                });
-                const payload = { totalLength, questions, byDifficulty: byDiff };
-                sendResponse({ success: true, data: payload });
-            } catch (error) {
-                console.error("Error in GET_TAG_PROBLEMS:", error);
-                sendResponse({ success: false, error: error.message });
-            }
+      try {
+        let rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
+        // Remove code block wrappers
+        rawText = rawText.replace(/```json\s*|```/g, '').trim();
+        const combos = JSON.parse(rawText);
+        if (!Array.isArray(combos)) return resolve([]);
+        resolve(combos);
+      } catch (err) {
+        console.warn("AI response parse failed, returning empty array:", err);
+        resolve([]); // fallback to empty array
+      }
+    });
+  });
+}
+
+
+function computeComboScoreWithOriginalFormula(combo, tagStats, tagTotals) {
+  if (!Array.isArray(combo) || combo.length === 0) return 0;
+
+  const alpha = 0.6; // same as your original tag weighting
+  const scoreSum = combo.reduce((sum, tag) => {
+    const stats = tagStats[tag] || { attempted: 0, solved: 0 };
+    const totals = tagTotals.find(t => t.name === tag);
+    let cov = 0;
+    if (totals && totals.total > 0) {
+      cov = Math.min(1, Math.max(0, totals.solved / totals.total));
+    } else {
+      cov = stats.attempted > 0 ? 1 : 0;
+    }
+    const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
+    return sum + (alpha * fam + (1 - alpha) * cov);
+  }, 0);
+
+  return scoreSum / combo.length;
+}
+
+
+
+
+function calculateComboScore(combo, tagStats, alpha = 0.6) {
+  if (!Array.isArray(combo) || combo.length === 0) return 0;
+  const total = combo.reduce((sum, tag) => {
+    const stats = tagStats[tag] || { attempted: 0, solved: 0 };
+    const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
+    const cov = stats.attempted > 0 ? 1 : 0;
+    return sum + (alpha * fam + (1 - alpha) * cov);
+  }, 0);
+  return total / combo.length;
+}
+
+async function fetchGlobalProblemsByTag(tagSlug) {
+  try {
+    const query = `
+      query problemsetQuestionList($filters: QuestionFilterInput, $limit: Int) {
+        problemsetQuestionList(
+          limit: $limit
+          filters: $filters
+        ) {
+          total
         }
-    })();
-    return true; // Keep the message channel open for sendResponse
-});
+      }
+    `;
+    const variables = { filters: { topicSlugs: [tagSlug] }, limit: 1 }; // limit=1, we just need total
+    const resp = await fetchLeetCodeGraphQL(query, variables);
+    const total = resp?.data?.problemsetQuestionList?.total || 0;
+    return total;
+  } catch (err) {
+    console.warn(`Failed to fetch global problem total for tag ${tagSlug}:`, err);
+    return 0;
+  }
+}
+async function fetchUserAttemptedSolvedByTag(tagSlug) {
+  try {
+    const infos = await fetchUserTopicProgress(); // already defined in your code
+    const tagInfo = infos.find(i => i.slug === tagSlug);
+    if (!tagInfo) return { solved: 0, totalAttempted: 0 };
+    return { solved: tagInfo.finishedNum, totalAttempted: tagInfo.totalNum };
+  } catch (err) {
+    console.warn(`Failed to fetch user progress for tag ${tagSlug}:`, err);
+    return { solved: 0, totalAttempted: 0 };
+  }
+}
+
 
 // --- Auto-trigger on page load ---
 // Check if on a problem page and trigger calculation
