@@ -217,29 +217,11 @@ async function updateUserTopicProgressForTags(topicTags) {
   }
 }
 
-let tagTotalsForDisplay = [];
-let avgTagScoreForCurrentProblem = 0;
-if (probData.topicTags.length > 0) {
-  let aiCombos = [];
-  try {
-    aiCombos = await fetchTagCombinationsFromAI(probData.title, probData.topicTags.map(t => t.name));
-    console.log("AI combos fetched:", aiCombos);
-      // --- Add this ---
-  const userTagProgress = await fetchUserTopicProgress();
-   tagTotalsForDisplay = userTagProgress.map(i => ({
-    name: i.name,
-    slug: i.slug,
-    total: i.totalNum,
-    solved: i.finishedNum
-  }));
-
-  } catch (err) {
-    console.warn("Failed to fetch AI tag combinations:", err);
-  }
 
 // --- Core Calculation Logic (Moved from popup.js, slightly adapted) ---
 async function calculateAndDisplayAccuracy() {
   console.log('Starting accuracy calculation...');
+  let myAccAdj = 0; // default
   const currentProblemSlug = getCurrentProblemDetailsFromURL();
   if (!currentProblemSlug) {
     console.log("Not on a problem page. Skipping accuracy display.");
@@ -287,6 +269,7 @@ async function calculateAndDisplayAccuracy() {
   try {
     const resp = await fetchLeetCodeGraphQL(problemQuery, { titleSlug: currentProblemSlug });
     probData = resp.data.question;
+    
     if (!probData) {
       console.error("Could not fetch current problem data.", resp);
       return;
@@ -295,6 +278,32 @@ async function calculateAndDisplayAccuracy() {
     console.error("Error fetching current problem details:", err);
     return;
   }
+  const currentProblemTags = probData.topicTags.map(t => t.name);
+  let tagTotalsForDisplay = [];
+let avgTagScoreForCurrentProblem = 0;
+let tagScores = {};
+let diffScores = {};
+let allSolvedCount = 0;
+let allAttemptedCount = 0;
+let allWrongCount = 0;
+if (probData.topicTags.length > 0) {
+  let aiCombos = [];
+  try {
+    aiCombos = await fetchTagCombinationsFromAI(probData.title, probData.topicTags.map(t => t.name));
+    console.log("AI combos fetched:", aiCombos);
+      // --- Add this ---
+  const userTagProgress = await fetchUserTopicProgress();
+   tagTotalsForDisplay = userTagProgress.map(i => ({
+    name: i.name,
+    slug: i.slug,
+    total: i.totalNum,
+    solved: i.finishedNum
+  }));
+
+  } catch (err) {
+    console.warn("Failed to fetch AI tag combinations:", err);
+  }
+
 
   // Fetch all submissions (only if needed)
   // allSubmissionsRaw is already loaded from storage or cleared by session management
@@ -481,14 +490,14 @@ async function calculateAndDisplayAccuracy() {
 
   const { tagScores, diffScores } = computeScores(tagStats, diffStats, 0.6, globalTotalsByDiff, globalSolvedByDiff);
 
-  const allSolvedCount = new Set(submissions.filter(s => s.status === "AC").map(s => s.problem)).size;
-  const allAttemptedCount = new Set(submissions.map(s => s.problem)).size;
-  const allWrongCount = submissions.filter(s => s.status !== "AC").length;
+  allSolvedCount = new Set(submissions.filter(s => s.status === "AC").map(s => s.problem)).size;
+  allAttemptedCount = new Set(submissions.map(s => s.problem)).size;
+  allWrongCount = submissions.filter(s => s.status !== "AC").length;
+  
+  if (allAttemptedCount > 0) {
+      myAccAdj = ((allSolvedCount + 1) / (allAttemptedCount + 2));
+  }
 
-  const myAccAdj = ((allSolvedCount + 1) / (allAttemptedCount + 2)); // Simple Acceptance rate with smoothing
-
-  const currentProblemTags = probData.topicTags.map(t => t.name);
-  const currentProblemDifficulty = probData.difficulty;
 
 
   const validCombos = (aiCombos || []).filter(c => Array.isArray(c) && c.length > 0);
@@ -505,9 +514,10 @@ async function calculateAndDisplayAccuracy() {
         const acc = stats.totalSubs > 0 ? stats.correctSubs / stats.totalSubs : 0;
 
         // --- NEW: Fetch global total and user solved for this tag ---
-        const globalTotal = await fetchGlobalProblemsByTag(t.slug); // returns total problems for this tag
+        const globalTotal = await fetchGlobalProblemsByTag(t.slug);
         const userSolved = stats.solved;
         const solvedRatio = globalTotal > 0 ? userSolved / globalTotal : 0;
+
 
         // --- Combine factors ---
         const alpha = 0.5; // familiarity weight
@@ -523,7 +533,7 @@ async function calculateAndDisplayAccuracy() {
   }
 }
 
-  
+let currentProblemDifficulty = probData?.difficulty || "Easy";
  
   const overallDifficultyScoreForCurrentProblem = diffScores[currentProblemDifficulty]?.score || 0;
 
