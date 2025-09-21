@@ -35,7 +35,7 @@ async function fetchLeetCodeGraphQL(query, variables) {
   if (query.includes("problemsetQuestionListV2") && (!jsonResponse.data || !jsonResponse.data.problemsetQuestionListV2)) {
       console.error("Unexpected GraphQL data structure for problemsetQuestionListV2:", jsonResponse);
       throw new Error("Unexpected GraphQL response structure. Missing data.problemsetQuestionListV2 for problemsetQuestionListV2.");
-  }
+  }// can i remove this
 
   return jsonResponse; // Return the full JSON response
 }
@@ -98,7 +98,7 @@ async function updateGlobalDifficultyTotalsAndSolved() {
         hardAll: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: HARD }) { total: totalNum }
         hardSolved: questionList(categorySlug: "", limit: 1, skip: 0, filters: { difficulty: HARD, status: AC }) { total: totalNum }
       }
-    `;
+    `; //categorySlug is mandatory field for the api call
     const data = await fetchLeetCodeGraphQL(query, {});
     const res = data && data.data;
     const totals = {
@@ -156,7 +156,7 @@ async function fetchAllSubmissions() {
     }
     await chrome.storage.local.set({ allSubmissions: allSubmissions });
     return allSubmissions;
-}
+} // can i remove this and use userProgressKnowledge to fetch tagwise total vs solved
 
 // --- Function to fetch current user's username ---
 async function fetchCurrentUsername() {
@@ -215,7 +215,7 @@ async function updateUserTopicProgressForTags(topicTags) {
   } catch (e) {
     console.warn('Failed to update user topic progress:', e);
   }
-}
+} // to dynamicallu update the tag wise progress, not yet called
 
 
 // --- Core Calculation Logic (Moved from popup.js, slightly adapted) ---
@@ -280,25 +280,25 @@ async function calculateAndDisplayAccuracy() {
   }
   const currentProblemTags = probData.topicTags.map(t => t.name);
   let tagTotalsForDisplay = [];
-let avgTagScoreForCurrentProblem = 0;
-let tagScores = {};
-let diffScores = {};
-let allSolvedCount = 0;
-let allAttemptedCount = 0;
-let allWrongCount = 0;
-if (probData.topicTags.length > 0) {
-  let aiCombos = [];
-  try {
-    aiCombos = await fetchTagCombinationsFromAI(probData.title, probData.topicTags.map(t => t.name));
-    console.log("AI combos fetched:", aiCombos);
-      // --- Add this ---
-  const userTagProgress = await fetchUserTopicProgress();
-   tagTotalsForDisplay = userTagProgress.map(i => ({
-    name: i.name,
-    slug: i.slug,
-    total: i.totalNum,
-    solved: i.finishedNum
-  }));
+  let avgTagScoreForCurrentProblem = 0;
+  let tagScores = {};
+  let diffScores = {};
+  let allSolvedCount = 0;
+  let allAttemptedCount = 0;
+  let allWrongCount = 0;
+  if (probData.topicTags.length > 0) {
+    let aiCombos = [];
+    try {
+      aiCombos = await fetchTagCombinationsFromAI(probData.title, probData.topicTags.map(t => t.name));
+      console.log("AI combos fetched:", aiCombos);
+        // --- Add this ---
+    const userTagProgress = await fetchUserTopicProgress();
+    tagTotalsForDisplay = userTagProgress.map(i => ({
+      name: i.name,
+      slug: i.slug,
+      total: i.totalNum,
+      solved: i.finishedNum
+    }));
 
   } catch (err) {
     console.warn("Failed to fetch AI tag combinations:", err);
@@ -329,7 +329,7 @@ if (probData.topicTags.length > 0) {
     problemDetailsCache = await fetchAndCacheProblemDetailsForSlugs(slugsToFetch); // This function now returns the updated cache
   }
 
-  // Prepare submissions data with full problem details
+  // Prepare submissions data with full problem details - since we cant fetch name, tags, difficulty, status from one query
   const submissions = allSubmissionsRaw.map(s => {
     const problemDetail = problemDetailsCache[s.titleSlug];
     if (!problemDetail) {
@@ -338,7 +338,7 @@ if (probData.topicTags.length > 0) {
     }
     return {
       problem: s.titleSlug,
-      tags: problemDetail.topicTags.map(t => t.name),
+      tags: problemDetail.topicTags.map(t => t.name), //tag : name of the slugs like hashtable, array...
       difficulty: problemDetail.difficulty,
       status: s.status === 10 ? "AC" : "WA"
     };
@@ -353,7 +353,7 @@ if (probData.topicTags.length > 0) {
 
   // --- Calculation Functions ---
 
-  function calculateStats(submissions) { // Removed totalProblemsByTag, totalProblemsByDifficulty
+  function calculateStats(submissions) { 
     const tagStats = {};
     const diffStats = {};
 
@@ -410,22 +410,21 @@ if (probData.topicTags.length > 0) {
   }
 
   function computeScores(tagStats, diffStats, alpha = 0.6, globalTotalsByDiff = null, globalSolvedByDiff = null) { // Removed totalProblemsByTag, totalProblemsByDifficulty
-    const tagScores = {};
-    const diffScores = {};
+    let tagScores = {};
+    let diffScores = {};
 
     for (let tag in tagStats) {
-      const fam = tagStats[tag].attempted > 0 ? tagStats[tag].solved / tagStats[tag].attempted : 0;
-      const cov = tagStats[tag].attempted > 0 ? 1 : 0; // Simplified coverage (display adjusted later)
-      const acc = tagStats[tag].totalSubs > 0 ? tagStats[tag].correctSubs / tagStats[tag].totalSubs : 0;
+      const fam = tagStats[tag].attempted > 0 ? tagStats[tag].solved / tagStats[tag].attempted : 0; //how many encountered vs how many solved
+      const acc = tagStats[tag].totalSubs > 0 ? tagStats[tag].correctSubs / tagStats[tag].totalSubs : 0; // focussed on user submissions per tag
       // Get global totals for this tag
       const totals = tagTotalsForDisplay.find(t => t.name === tag);
-      const completion = totals && totals.total > 0 ? totals.solved / totals.total : 0;
+      const completion = totals && totals.total > 0 ? totals.solved / totals.total : 0; // total problems solved and total present under a tag
 
       tagScores[tag] = {
         familiarity: fam,
         coverage: completion,
         accuracy: acc,
-        score: alpha * fam + (1 - alpha) * cov
+        score: alpha * fam + (1 - alpha) * completion // more accurate
       };
     }
 
@@ -452,15 +451,15 @@ if (probData.topicTags.length > 0) {
       const fam = diffStats[d]?.attempted > 0 ? diffStats[d].solved / diffStats[d].attempted : 0;
       const acc = diffStats[d]?.totalSubs > 0 ? diffStats[d].correctSubs / diffStats[d].totalSubs : 0;
       let cov = 0;
-      if (d === 'Easy') {
+      if (d === 'Easy') { // one can solve easy if they can solve easy, med, hard
         const num = solvedE + solvedM + solvedH;
         const den = totalE + totalM + totalH;
         cov = den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
-      } else if (d === 'Medium') {
+      } else if (d === 'Medium') { // one can solve med probs only if they can solve med or hard
         const num = solvedM + solvedH;
         const den = totalM + totalH;
         cov = den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
-      } else if (d === 'Hard') {
+      } else if (d === 'Hard') { 
         const num = solvedH;
         const den = totalH;
         cov = den > 0 ? Math.min(1, Math.max(0, num / den)) : 0;
@@ -487,9 +486,9 @@ if (probData.topicTags.length > 0) {
   let fetchedTotalsSolved = await updateGlobalDifficultyTotalsAndSolved();
   let globalTotalsByDiff = fetchedTotalsSolved ? fetchedTotalsSolved.totals : { Easy: 0, Medium: 0, Hard: 0 };
   let globalSolvedByDiff = fetchedTotalsSolved ? fetchedTotalsSolved.solved : { Easy: 0, Medium: 0, Hard: 0 };
-
-  const { tagScores, diffScores } = computeScores(tagStats, diffStats, 0.6, globalTotalsByDiff, globalSolvedByDiff);
-
+  const scores = computeScores(tagStats, diffStats, 0.6, globalTotalsByDiff, globalSolvedByDiff);
+  tagScores = scores.tagScores;
+  diffScores = scores.diffScores;
   allSolvedCount = new Set(submissions.filter(s => s.status === "AC").map(s => s.problem)).size;
   allAttemptedCount = new Set(submissions.map(s => s.problem)).size;
   allWrongCount = submissions.filter(s => s.status !== "AC").length;
@@ -502,11 +501,10 @@ if (probData.topicTags.length > 0) {
 
   const validCombos = (aiCombos || []).filter(c => Array.isArray(c) && c.length > 0);
   if (validCombos.length > 0) {
-    const comboScores = validCombos.map(c => computeComboScoreWithOriginalFormula(c, tagStats, tagTotalsForDisplay));
+    const comboScores = validCombos.map(c => computeComboScoreWithOriginalFormula(c, tagStats, tagTotalsForDisplay)); // each item of combos calculation
     avgTagScoreForCurrentProblem = Math.max(...comboScores); // pick the best combo
   } else {
-    // fallback to simple average over all tags (your original method)
-    // fallback to simple average over all tags
+    // fallback to simple average over all tags - default prev method
     let sumScores = 0;
     for (const t of probData.topicTags) {
         const stats = tagStats[t.name] || { attempted: 0, solved: 0 };
@@ -515,7 +513,7 @@ if (probData.topicTags.length > 0) {
 
         // --- NEW: Fetch global total and user solved for this tag ---
         const globalTotal = await fetchGlobalProblemsByTag(t.slug);
-        const userSolved = stats.solved;
+        const userSolved = stats.solved; 
         const solvedRatio = globalTotal > 0 ? userSolved / globalTotal : 0;
 
 
@@ -532,10 +530,11 @@ if (probData.topicTags.length > 0) {
 
   }
 }
-
+console.log(diffScores)
 let currentProblemDifficulty = probData?.difficulty || "Easy";
  
   const overallDifficultyScoreForCurrentProblem = diffScores[currentProblemDifficulty]?.score || 0;
+// const overallDifficultyScoreForCurrentProblem = diffScores[probData.name]?.score || 0;
 
   const W1 = 0.4, W2 = 0.4, W3 = 0.2; // Adjusted weights
 
@@ -680,7 +679,7 @@ Return ONLY as a JSON array of arrays. Example:
 function computeComboScoreWithOriginalFormula(combo, tagStats, tagTotals) {
   if (!Array.isArray(combo) || combo.length === 0) return 0;
 
-  const alpha = 0.6; // same as your original tag weighting
+  const alpha = 0.6; 
   const scoreSum = combo.reduce((sum, tag) => {
     const stats = tagStats[tag] || { attempted: 0, solved: 0 };
     const totals = tagTotals.find(t => t.name === tag);
@@ -700,16 +699,16 @@ function computeComboScoreWithOriginalFormula(combo, tagStats, tagTotals) {
 
 
 
-function calculateComboScore(combo, tagStats, alpha = 0.6) {
-  if (!Array.isArray(combo) || combo.length === 0) return 0;
-  const total = combo.reduce((sum, tag) => {
-    const stats = tagStats[tag] || { attempted: 0, solved: 0 };
-    const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
-    const cov = stats.attempted > 0 ? 1 : 0;
-    return sum + (alpha * fam + (1 - alpha) * cov);
-  }, 0);
-  return total / combo.length;
-}
+// function calculateComboScore(combo, tagStats, alpha = 0.6) {
+//   if (!Array.isArray(combo) || combo.length === 0) return 0;
+//   const total = combo.reduce((sum, tag) => {
+//     const stats = tagStats[tag] || { attempted: 0, solved: 0 };
+//     const fam = stats.attempted > 0 ? stats.solved / stats.attempted : 0;
+//     const cov = stats.attempted > 0 ? 1 : 0;
+//     return sum + (alpha * fam + (1 - alpha) * cov);
+//   }, 0);
+//   return total / combo.length;
+// }
 
 async function fetchGlobalProblemsByTag(tagSlug) {
   try {

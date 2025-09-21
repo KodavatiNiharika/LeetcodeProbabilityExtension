@@ -8,7 +8,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'X-goog-api-key': ' key'
+              'X-goog-api-key': 'key' 
             },
             body: JSON.stringify({
               contents: [{ parts: [{ text: request.prompt }] }]
