@@ -1,34 +1,50 @@
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+
+  // ---- AI Prompt Handler ----
   if (request.type === 'ai_prompt') {
     (async () => {
       try {
+        if (!request.prompt) throw new Error("No prompt provided");
         const res = await fetch(
           'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
           {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'X-goog-api-key': 'key' 
+              'X-goog-api-key': 'YOUR_API_KEY'
             },
             body: JSON.stringify({
               contents: [{ parts: [{ text: request.prompt }] }]
             })
           }
         );
-
         const data = await res.json();
-        console.log("Full response from Gemini:", JSON.stringify(data, null, 2));
-
-        // Send the full response to content script
         sendResponse({ success: true, data });
-
       } catch (err) {
         console.error("AI request failed:", err);
         sendResponse({ success: false, error: err.message });
       }
     })();
-
-    // Keep the message channel open for async response
-    return true;
+    return true; // Keep port open for async response
   }
+
+  // ---- GraphQL Handler ----
+  if (request.type === 'graphql') {
+    (async () => {
+      try {
+        const res = await fetch('https://leetcode.com/graphql/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: request.query, variables: request.variables })
+        });
+        const data = await res.json();
+        sendResponse({ success: true, data });
+      } catch (err) {
+        console.error("GraphQL fetch failed:", err);
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // Keep port open
+  }
+
 });
